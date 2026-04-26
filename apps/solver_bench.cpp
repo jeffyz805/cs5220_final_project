@@ -31,6 +31,7 @@
 #if MAC_USE_MPI
 #include <mpi.h>
 #include "solvers/mpi/dist_solvers.h"
+#include "solvers/mpi/distributed_blas.h"
 #include "solvers/mpi/distributed_csr.h"
 #include "solvers/mpi/partition.h"
 #endif
@@ -95,21 +96,38 @@ bool starts_with(const std::string& s, std::string_view p) {
     return s.size() >= p.size() && std::string_view(s).substr(0, p.size()) == p;
 }
 
+struct CommBreakdown {
+    double t_alltoallv  = 0.0;
+    double t_allreduce  = 0.0;
+    double t_local_spmv = 0.0;
+    double t_pack       = 0.0;
+    std::size_t bytes_alltoallv = 0;
+    std::size_t bytes_allreduce = 0;
+    std::size_t n_alltoallv     = 0;
+    std::size_t n_allreduce     = 0;
+};
+
 void emit_csv(const Args& a, const std::string& mode,
               int ranks, int iters, int converged, int stagnated, int diverged,
-              double rresid, double err, double t_gen, double t_solve) {
+              double rresid, double err, double t_gen, double t_solve,
+              const CommBreakdown& cb) {
     auto write = [&](std::FILE* f, bool header) {
         if (header) {
             std::fprintf(f, "tag,solver,mode,ranks,N,nnz_per_row,alpha,rtol,max_iter,"
                             "iters,converged,stagnated,diverged,"
-                            "rresid,err,t_gen,t_solve\n");
+                            "rresid,err,t_gen,t_solve,"
+                            "t_alltoallv,t_allreduce,t_local_spmv,t_pack,"
+                            "bytes_alltoallv,bytes_allreduce,n_alltoallv,n_allreduce\n");
         }
         std::fprintf(f,
-            "%s,%s,%s,%d,%d,%d,%.6g,%.6g,%d,%d,%d,%d,%d,%.6e,%.6e,%.6e,%.6e\n",
+            "%s,%s,%s,%d,%d,%d,%.6g,%.6g,%d,%d,%d,%d,%d,%.6e,%.6e,%.6e,%.6e,"
+            "%.6e,%.6e,%.6e,%.6e,%zu,%zu,%zu,%zu\n",
             a.tag.c_str(), a.solver.c_str(), mode.c_str(), ranks,
             a.N, a.nnz_per_row, a.alpha, a.rtol, a.max_iter,
             iters, converged, stagnated, diverged,
-            rresid, err, t_gen, t_solve);
+            rresid, err, t_gen, t_solve,
+            cb.t_alltoallv, cb.t_allreduce, cb.t_local_spmv, cb.t_pack,
+            cb.bytes_alltoallv, cb.bytes_allreduce, cb.n_alltoallv, cb.n_allreduce);
     };
     if (a.csv.empty()) {
         write(stdout, true);
@@ -165,7 +183,7 @@ int run_serial(const Args& a) {
 
     emit_csv(a, "serial", 1, ires.iters,
              (int)ires.converged, (int)ires.stagnated, (int)ires.diverged,
-             rresid, err, t_gen, t_solve);
+             rresid, err, t_gen, t_solve, CommBreakdown{});
     return 0;
 }
 
@@ -220,6 +238,10 @@ int run_mpi(const Args& a) {
     iopts.rtol     = a.rtol;
     iopts.max_iter = a.max_iter;
 
+    // Reset comm-stat counters before the solve.
+    A_dist.reset_stats();
+    g_allreduce_stats.reset();
+
     mac::solvers::IterativeResult ires;
     MPI_Barrier(MPI_COMM_WORLD);
     auto t0 = clk::steady_clock::now();
@@ -250,10 +272,36 @@ int run_mpi(const Args& a) {
     MPI_Allreduce(&local_b2, &global_b2, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     double rresid = std::sqrt(global_r2 / std::max(global_b2, 1e-300));
 
+    // Comm-vs-compute breakdown. Reduce per-rank values to MAX (slowest rank
+    // dominates wall time) and SUM (for byte counts).
+    const auto& halo = A_dist.stats();
+    double  local_t[4] = {halo.time_alltoallv, g_allreduce_stats.total_seconds,
+                          halo.time_local_spmv, halo.time_pack};
+    double  max_t[4]   = {0, 0, 0, 0};
+    MPI_Reduce(local_t, max_t, 4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    unsigned long long local_b[4] = {
+        (unsigned long long)halo.bytes_sent_total,
+        (unsigned long long)g_allreduce_stats.bytes_sent,
+        (unsigned long long)halo.spmv_calls,
+        (unsigned long long)g_allreduce_stats.n_calls};
+    unsigned long long sum_b[4] = {0, 0, 0, 0};
+    MPI_Reduce(local_b, sum_b, 4, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
+        CommBreakdown cb;
+        cb.t_alltoallv     = max_t[0];
+        cb.t_allreduce     = max_t[1];
+        cb.t_local_spmv    = max_t[2];
+        cb.t_pack          = max_t[3];
+        cb.bytes_alltoallv = static_cast<std::size_t>(sum_b[0]);
+        cb.bytes_allreduce = static_cast<std::size_t>(sum_b[1]);
+        cb.n_alltoallv     = static_cast<std::size_t>(sum_b[2]);
+        cb.n_allreduce     = static_cast<std::size_t>(sum_b[3]);
+
         emit_csv(a, "mpi", size, ires.iters,
                  (int)ires.converged, (int)ires.stagnated, (int)ires.diverged,
-                 rresid, /*err=*/-1.0, t_gen, t_solve);
+                 rresid, /*err=*/-1.0, t_gen, t_solve, cb);
     }
     return 0;
 }
