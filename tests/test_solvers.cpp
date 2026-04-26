@@ -18,6 +18,8 @@
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
 
+#include <algorithm>
+#include <cmath>
 #include <random>
 #include <vector>
 
