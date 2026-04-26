@@ -82,7 +82,7 @@ DistributedCsr::DistributedCsr(MPI_Comm comm,
                 Index c = ci[k];
                 Index new_c;
                 if (c >= row_start && c < row_end) new_c = c - row_start;
-                else                                new_c = col_to_halo.at(c);
+                else                                new_c = n_local_ + col_to_halo.at(c);
                 bld.push(r, new_c, vs[k]);
             }
         }

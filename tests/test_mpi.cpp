@@ -7,6 +7,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -96,15 +97,13 @@ int main(int argc, char** argv) {
     // --- Serial solutions (rank 0 only) ---
     std::vector<double> x_cg_serial(N, 0.0);
     std::vector<double> x_pcg_serial(N, 0.0);
-    std::vector<double> x_jac_serial(N, 0.0);
     std::vector<double> x_gs_serial(N, 0.0);
     if (rank == 0) {
         solvers::IterativeOpts opts;
-        opts.rtol     = 1e-10;
-        opts.max_iter = 5000;
+        opts.rtol     = 1e-8;
+        opts.max_iter = 2000;
         solvers::cg          (A_global, rhs.b, x_cg_serial,  opts);
         solvers::pcg_jacobi  (A_global, rhs.b, x_pcg_serial, opts);
-        solvers::jacobi      (A_global, rhs.b, x_jac_serial, opts);   // may diverge — that's fine
         solvers::gauss_seidel(A_global, rhs.b, x_gs_serial,  opts);
     }
 
@@ -119,10 +118,58 @@ int main(int argc, char** argv) {
     // --- Distributed solves ---
     auto fresh_x = [&]() { return std::vector<double>(A_dist.n_local(), 0.0); };
     solvers::IterativeOpts dopts;
-    dopts.rtol     = 1e-10;
-    dopts.max_iter = 5000;
+    dopts.rtol     = 1e-8;
+    dopts.max_iter = 2000;
+
+    // SpMV correctness check: distributed A * x must match serial A * x.
+    // Detects halo-renumbering bugs without depending on solver convergence.
+    {
+        std::vector<double> x_global(N), y_serial(N), y_local(A_dist.n_local());
+        for (int i = 0; i < N; ++i) x_global[i] = std::sin(0.123 * i + 0.7);
+        if (rank == 0) la::spmv(A_global, x_global, y_serial);
+
+        auto x_local = std::span<const double>(x_global)
+            .subspan(part.row_start(rank), A_dist.n_local());
+        A_dist.spmv(x_local, y_local);
+
+        std::vector<int> counts(size), displs(size + 1, 0);
+        for (int p = 0; p < size; ++p) counts[p] = static_cast<int>(part.local_rows(p));
+        for (int p = 0; p < size; ++p) displs[p + 1] = displs[p] + counts[p];
+        std::vector<double> y_gathered;
+        if (rank == 0) y_gathered.resize(N);
+        MPI_Gatherv(y_local.data(), static_cast<int>(y_local.size()), MPI_DOUBLE,
+                    rank == 0 ? y_gathered.data() : nullptr,
+                    counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+        int spmv_ok = 1;
+        if (rank == 0) {
+            double max_diff = 0.0;
+            for (int i = 0; i < N; ++i)
+                max_diff = std::max(max_diff, std::abs(y_gathered[i] - y_serial[i]));
+            std::printf("  [SpMV] max|dist - serial| = %.3e %s\n",
+                        max_diff, max_diff <= 1e-12 ? "OK" : "FAIL");
+            spmv_ok = (max_diff <= 1e-12) ? 1 : 0;
+        }
+        MPI_Bcast(&spmv_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (!spmv_ok) {
+            if (rank == 0) std::printf("test_mpi: FAIL (SpMV — bailing before solvers)\n");
+            MPI_Finalize();
+            return 1;
+        }
+    }
+
+    auto stamp = [&](const char* label) {
+        if (rank == 0) {
+            std::printf("[%6.2fs] %s\n",
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                label);
+            std::fflush(stdout);
+        }
+    };
 
     if (rank == 0) std::printf("test_mpi: N=%d, size=%d\n", N, size);
+    stamp("setup done");
 
     std::vector<Case> results;
 
@@ -130,35 +177,44 @@ int main(int argc, char** argv) {
         auto x = fresh_x();
         auto r = solvers::mpi::dist_cg(A_dist, local_b, x, dopts);
         if (rank == 0) std::printf("dist_cg     iters=%d converged=%d\n", r.iters, r.converged);
+        std::fflush(stdout);
         results.push_back({"dist_cg",
             gather_and_compare(MPI_COMM_WORLD, part, x, x_cg_serial, "dist_cg")});
     }
+    stamp("dist_cg done");
     {
         auto x = fresh_x();
         auto r = solvers::mpi::dist_pcg_jacobi(A_dist, local_b, x, dopts);
         if (rank == 0) std::printf("dist_pcg    iters=%d converged=%d\n", r.iters, r.converged);
+        std::fflush(stdout);
         results.push_back({"dist_pcg",
             gather_and_compare(MPI_COMM_WORLD, part, x, x_pcg_serial, "dist_pcg")});
     }
+    stamp("dist_pcg done");
     {
-        // block-GS converges to the same solution as serial GS *if* both
-        // converge — but with N=200, dense random SPD, alpha=4, it should.
+        // block-GS converges to the same solution as serial GS when both
+        // converge — for N=200, alpha=4 it should within a few hundred iters.
         auto x = fresh_x();
         auto r = solvers::mpi::dist_block_gs(A_dist, local_b, x, dopts);
         if (rank == 0) std::printf("dist_blkgs  iters=%d converged=%d\n", r.iters, r.converged);
-        // Loose tol — block-Jacobi/inner-GS converges to same A^-1 b when it
-        // converges, but residual tolerance imprecision compounds.
+        std::fflush(stdout);
         results.push_back({"dist_block_gs",
             gather_and_compare(MPI_COMM_WORLD, part, x, x_gs_serial, "dist_block_gs", 1e-4)});
     }
-    // dist_jacobi typically diverges on random BᵀB+αI (not diag-dominant).
-    // Run it and just record; don't assert solution match.
+    stamp("dist_block_gs done");
+
+    // dist_jacobi typically diverges or stagnates on random BᵀB+αI. Cap its
+    // iters tight; we only want a behavioral log line, not convergence.
     {
+        solvers::IterativeOpts jopts = dopts;
+        jopts.max_iter = 50;
         auto x = fresh_x();
-        auto r = solvers::mpi::dist_jacobi(A_dist, local_b, x, dopts);
-        if (rank == 0) std::printf("dist_jacobi iters=%d converged=%d (info only)\n",
-                                   r.iters, r.converged);
+        auto r = solvers::mpi::dist_jacobi(A_dist, local_b, x, jopts);
+        if (rank == 0) std::printf("dist_jacobi iters=%d rresid=%.3e (info only, capped)\n",
+                                   r.iters, r.final_rresid);
+        std::fflush(stdout);
     }
+    stamp("dist_jacobi done");
 
     int all_ok = 1;
     if (rank == 0) {
