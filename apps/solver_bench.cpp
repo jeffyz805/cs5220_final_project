@@ -1,20 +1,15 @@
-// Synthetic SPD solver benchmark driver.
+// Synthetic SPD solver benchmark driver (serial + MPI).
 //
-// Runs a single solver on a generated SPD system, measures wall time + iter
-// count + final residual, dumps a one-line CSV record. Designed to be invoked
-// many times by SLURM scripts (one row per srun).
+// Serial solvers (no MPI launcher needed):
+//   solver_bench --N 10000 --solver cg
+//   --solver in {jacobi, gs, rbgs, cg, pcg, dense_chol}
 //
-// CLI:
-//   solver_bench --N <int> --solver <name> [options]
-// solvers: jacobi, gs, rbgs, cg, pcg, dense_chol
-// options:
-//   --nnz_per_row <int>  (default 8)
-//   --alpha       <real> (default 1.0)
-//   --rtol        <real> (default 1e-8)
-//   --max_iter    <int>  (default 5000)
-//   --seed        <int>  (default 0xC5220)
-//   --csv         <path> (default stdout, append; header written if new)
-//   --tag         <str>  (free-form label written into CSV)
+// Distributed solvers (run under srun/mpirun):
+//   srun -n 64 solver_bench --N 1000000 --solver dist_cg --csv out.csv
+//   --solver in {dist_cg, dist_pcg, dist_jacobi, dist_block_gs}
+//
+// Distributed mode auto-detected by solver name prefix `dist_`. Rank 0 alone
+// emits the CSV row to keep output uncluttered.
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +20,7 @@
 #include <fstream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bench/spd_generator.h"
@@ -32,25 +28,32 @@
 #include "solvers/direct/dense_cholesky.h"
 #include "solvers/iterative/iterative.h"
 
+#if MAC_USE_MPI
+#include <mpi.h>
+#include "solvers/mpi/dist_solvers.h"
+#include "solvers/mpi/distributed_csr.h"
+#include "solvers/mpi/partition.h"
+#endif
+
 namespace {
 
 struct Args {
-    int         N            = 1000;
-    int         nnz_per_row  = 8;
-    double      alpha        = 1.0;
-    double      rtol         = 1e-8;
-    int         max_iter     = 5000;
-    std::uint64_t seed       = 0xC5220ULL;
-    std::string solver       = "cg";
-    std::string csv          = "";
-    std::string tag          = "";
+    int           N            = 1000;
+    int           nnz_per_row  = 8;
+    double        alpha        = 1.0;
+    double        rtol         = 1e-8;
+    int           max_iter     = 5000;
+    std::uint64_t seed         = 0xC5220ULL;
+    std::string   solver       = "cg";
+    std::string   csv          = "";
+    std::string   tag          = "";
 };
 
 void usage(const char* p) {
     std::fprintf(stderr,
-        "Usage: %s --N <n> --solver <jacobi|gs|rbgs|cg|pcg|dense_chol> "
-        "[--nnz_per_row k] [--alpha a] [--rtol t] [--max_iter m] "
-        "[--seed s] [--csv path] [--tag str]\n", p);
+        "Usage: %s --N <n> --solver <name> [opts]\n"
+        "  serial: jacobi gs rbgs cg pcg dense_chol\n"
+        "  dist:   dist_cg dist_pcg dist_jacobi dist_block_gs\n", p);
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -63,7 +66,7 @@ bool parse_args(int argc, char** argv, Args& a) {
             }
             return argv[++i];
         };
-        if      (k == "--N")            a.N = std::atoi(next("--N"));
+        if      (k == "--N")            a.N = std::atoi(next(k.c_str()));
         else if (k == "--nnz_per_row")  a.nnz_per_row = std::atoi(next(k.c_str()));
         else if (k == "--alpha")        a.alpha = std::atof(next(k.c_str()));
         else if (k == "--rtol")         a.rtol  = std::atof(next(k.c_str()));
@@ -88,16 +91,41 @@ double rel_err(std::span<const double> x, std::span<const double> x_true) {
     return std::sqrt(num / std::max(den, 1e-300));
 }
 
-} // anon
+bool starts_with(const std::string& s, std::string_view p) {
+    return s.size() >= p.size() && std::string_view(s).substr(0, p.size()) == p;
+}
 
-int main(int argc, char** argv) {
-    Args a;
-    if (!parse_args(argc, argv, a)) return 2;
+void emit_csv(const Args& a, const std::string& mode,
+              int ranks, int iters, int converged, int stagnated, int diverged,
+              double rresid, double err, double t_gen, double t_solve) {
+    auto write = [&](std::FILE* f, bool header) {
+        if (header) {
+            std::fprintf(f, "tag,solver,mode,ranks,N,nnz_per_row,alpha,rtol,max_iter,"
+                            "iters,converged,stagnated,diverged,"
+                            "rresid,err,t_gen,t_solve\n");
+        }
+        std::fprintf(f,
+            "%s,%s,%s,%d,%d,%d,%.6g,%.6g,%d,%d,%d,%d,%d,%.6e,%.6e,%.6e,%.6e\n",
+            a.tag.c_str(), a.solver.c_str(), mode.c_str(), ranks,
+            a.N, a.nnz_per_row, a.alpha, a.rtol, a.max_iter,
+            iters, converged, stagnated, diverged,
+            rresid, err, t_gen, t_solve);
+    };
+    if (a.csv.empty()) {
+        write(stdout, true);
+    } else {
+        bool exists = std::ifstream(a.csv).good();
+        std::FILE* f = std::fopen(a.csv.c_str(), "a");
+        if (!f) { std::perror(a.csv.c_str()); std::exit(1); }
+        write(f, !exists);
+        std::fclose(f);
+    }
+}
 
+int run_serial(const Args& a) {
     namespace clk = std::chrono;
     using mac::la::Real;
 
-    // 1. Generate SPD system.
     mac::bench::SpdGenOpts gopts;
     gopts.n           = a.N;
     gopts.nnz_per_row = a.nnz_per_row;
@@ -107,72 +135,151 @@ int main(int argc, char** argv) {
     auto t_gen0 = clk::steady_clock::now();
     auto A = mac::bench::generate_spd(gopts);
     auto rhs = mac::bench::make_rhs(A, a.seed ^ 0x1u);
-    auto t_gen1 = clk::steady_clock::now();
-    double t_gen = clk::duration<double>(t_gen1 - t_gen0).count();
+    double t_gen = clk::duration<double>(clk::steady_clock::now() - t_gen0).count();
 
     std::vector<Real> x(a.N, 0.0);
-
-    // 2. Solve.
     mac::solvers::IterativeOpts iopts;
     iopts.rtol = a.rtol;
     iopts.max_iter = a.max_iter;
 
     mac::solvers::IterativeResult ires{};
-    bool is_iterative = true;
-
     auto t0 = clk::steady_clock::now();
-
     if      (a.solver == "jacobi") ires = mac::solvers::jacobi      (A, rhs.b, x, iopts);
     else if (a.solver == "gs")     ires = mac::solvers::gauss_seidel(A, rhs.b, x, iopts);
     else if (a.solver == "rbgs")   ires = mac::solvers::rb_gauss_seidel(A, rhs.b, x, iopts);
     else if (a.solver == "cg")     ires = mac::solvers::cg          (A, rhs.b, x, iopts);
     else if (a.solver == "pcg")    ires = mac::solvers::pcg_jacobi  (A, rhs.b, x, iopts);
     else if (a.solver == "dense_chol") {
-        is_iterative = false;
         mac::solvers::DenseCholesky chol(A);
         chol.solve(rhs.b, x);
+    } else {
+        std::fprintf(stderr, "unknown serial solver: %s\n", a.solver.c_str());
+        return 2;
     }
+    double t_solve = clk::duration<double>(clk::steady_clock::now() - t0).count();
+
+    std::vector<Real> r(a.N);
+    mac::la::residual(A, rhs.b, x, r);
+    double rresid = mac::la::nrm2(r) / std::max(mac::la::nrm2(rhs.b), 1e-300);
+    double err = rel_err(x, rhs.x_true);
+
+    emit_csv(a, "serial", 1, ires.iters,
+             (int)ires.converged, (int)ires.stagnated, (int)ires.diverged,
+             rresid, err, t_gen, t_solve);
+    return 0;
+}
+
+#if MAC_USE_MPI
+
+int run_mpi(const Args& a) {
+    namespace clk = std::chrono;
+    using mac::la::Real;
+    using namespace mac::solvers::mpi;
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // For now: rank 0 generates the global system and scatters. Scalable
+    // to N up to ~1e6 on a Perlmutter compute node.
+    mac::la::CsrMatrix A_global;
+    std::vector<Real> b_global;
+    if (rank == 0) {
+        mac::bench::SpdGenOpts gopts;
+        gopts.n           = a.N;
+        gopts.nnz_per_row = a.nnz_per_row;
+        gopts.alpha       = a.alpha;
+        gopts.seed        = a.seed;
+        A_global = mac::bench::generate_spd(gopts);
+        auto rhs = mac::bench::make_rhs(A_global, a.seed ^ 0x1u);
+        b_global = std::move(rhs.b);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto t_gen0 = clk::steady_clock::now();
+
+    auto part = RowPartition::make_block(a.N, size);
+    auto local = scatter_global_csr(MPI_COMM_WORLD, part, A_global);
+    DistributedCsr A_dist(MPI_COMM_WORLD, part, std::move(local));
+
+    // Scatter b.
+    std::vector<int> counts(size), displs(size + 1, 0);
+    for (int p = 0; p < size; ++p) counts[p] = static_cast<int>(part.local_rows(p));
+    for (int p = 0; p < size; ++p) displs[p + 1] = displs[p] + counts[p];
+    std::vector<Real> b_local(A_dist.n_local());
+    MPI_Scatterv(rank == 0 ? b_global.data() : nullptr,
+                 counts.data(), displs.data(), MPI_DOUBLE,
+                 b_local.data(), static_cast<int>(b_local.size()), MPI_DOUBLE,
+                 0, MPI_COMM_WORLD);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_gen = clk::duration<double>(clk::steady_clock::now() - t_gen0).count();
+
+    std::vector<Real> x_local(A_dist.n_local(), 0.0);
+    mac::solvers::IterativeOpts iopts;
+    iopts.rtol     = a.rtol;
+    iopts.max_iter = a.max_iter;
+
+    mac::solvers::IterativeResult ires;
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto t0 = clk::steady_clock::now();
+
+    if      (a.solver == "dist_cg")       ires = dist_cg          (A_dist, b_local, x_local, iopts);
+    else if (a.solver == "dist_pcg")      ires = dist_pcg_jacobi  (A_dist, b_local, x_local, iopts);
+    else if (a.solver == "dist_jacobi")   ires = dist_jacobi      (A_dist, b_local, x_local, iopts);
+    else if (a.solver == "dist_block_gs") ires = dist_block_gs    (A_dist, b_local, x_local, iopts);
     else {
-        std::fprintf(stderr, "unknown solver: %s\n", a.solver.c_str());
+        if (rank == 0) std::fprintf(stderr, "unknown distributed solver: %s\n", a.solver.c_str());
         return 2;
     }
 
-    auto t1 = clk::steady_clock::now();
-    double t_solve = clk::duration<double>(t1 - t0).count();
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_solve = clk::duration<double>(clk::steady_clock::now() - t0).count();
 
-    // 3. Final residual + error.
-    std::vector<Real> r(a.N);
-    mac::la::residual(A, rhs.b, x, r);
-    double rn = mac::la::nrm2(r);
-    double bn = mac::la::nrm2(rhs.b);
-    double rresid = bn > 0 ? rn / bn : rn;
-    double err = rel_err(x, rhs.x_true);
+    // Final residual: ||b - A x|| / ||b|| globally.
+    std::vector<Real> Ax_local(A_dist.n_local());
+    A_dist.spmv(x_local, Ax_local);
+    Real local_r2 = 0.0, local_b2 = 0.0;
+    for (std::size_t i = 0; i < b_local.size(); ++i) {
+        Real ri = b_local[i] - Ax_local[i];
+        local_r2 += ri * ri;
+        local_b2 += b_local[i] * b_local[i];
+    }
+    Real global_r2 = 0.0, global_b2 = 0.0;
+    MPI_Allreduce(&local_r2, &global_r2, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_b2, &global_b2, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    double rresid = std::sqrt(global_r2 / std::max(global_b2, 1e-300));
 
-    // 4. CSV emit.
-    auto write = [&](std::FILE* f, bool header) {
-        if (header) {
-            std::fprintf(f, "tag,solver,N,nnz_per_row,alpha,rtol,max_iter,"
-                            "iters,converged,stagnated,diverged,"
-                            "rresid,err,t_gen,t_solve\n");
-        }
-        std::fprintf(f,
-            "%s,%s,%d,%d,%.6g,%.6g,%d,%d,%d,%d,%d,%.6e,%.6e,%.6e,%.6e\n",
-            a.tag.c_str(), a.solver.c_str(), a.N, a.nnz_per_row,
-            a.alpha, a.rtol, a.max_iter,
-            ires.iters,
-            (int)ires.converged, (int)ires.stagnated, (int)ires.diverged,
-            rresid, err, t_gen, t_solve);
-        (void)is_iterative;
-    };
-
-    if (a.csv.empty()) {
-        write(stdout, true);
-    } else {
-        bool exists = std::ifstream(a.csv).good();
-        std::FILE* f = std::fopen(a.csv.c_str(), "a");
-        if (!f) { std::perror(a.csv.c_str()); return 1; }
-        write(f, !exists);
-        std::fclose(f);
+    if (rank == 0) {
+        emit_csv(a, "mpi", size, ires.iters,
+                 (int)ires.converged, (int)ires.stagnated, (int)ires.diverged,
+                 rresid, /*err=*/-1.0, t_gen, t_solve);
     }
     return 0;
+}
+
+#endif // MAC_USE_MPI
+
+} // anon
+
+int main(int argc, char** argv) {
+    Args a;
+    if (!parse_args(argc, argv, a)) return 2;
+
+    bool dist = starts_with(a.solver, "dist_");
+
+#if MAC_USE_MPI
+    if (dist) {
+        MPI_Init(&argc, &argv);
+        int rc = run_mpi(a);
+        MPI_Finalize();
+        return rc;
+    }
+#else
+    if (dist) {
+        std::fprintf(stderr, "this build has USE_MPI=OFF; rebuild w/ -DUSE_MPI=ON\n");
+        return 2;
+    }
+#endif
+    return run_serial(a);
 }
