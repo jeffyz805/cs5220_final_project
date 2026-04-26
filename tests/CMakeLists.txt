@@ -2,6 +2,7 @@ add_executable(mac_tests
   test_smoke.cpp
   test_solvers.cpp
   test_physics.cpp
+  test_mac.cpp
 )
 target_link_libraries(mac_tests PRIVATE mac_core Catch2::Catch2WithMain)
 if(USE_EIGEN_TESTS)

@@ -6,6 +6,9 @@ add_library(mac_core STATIC
   constraints/constraint.cpp
   constraints/assembler.cpp
   physics/integrator.cpp
+  mac/protein.cpp
+  mac/binding.cpp
+  mac/scenario.cpp
 )
 
 if(USE_MPI)
