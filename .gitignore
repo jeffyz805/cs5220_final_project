@@ -1,0 +1,17 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+*.o
+*.obj
+*.dSYM/
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+results/
+*.csv
+*.xyz
+*.vtk
+slurm-*.out
