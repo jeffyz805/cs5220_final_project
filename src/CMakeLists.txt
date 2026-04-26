@@ -3,6 +3,9 @@ add_library(mac_core STATIC
   la/blas.cpp
   solvers/iterative/iterative.cpp
   solvers/direct/dense_cholesky.cpp
+  constraints/constraint.cpp
+  constraints/assembler.cpp
+  physics/integrator.cpp
 )
 
 if(USE_MPI)
