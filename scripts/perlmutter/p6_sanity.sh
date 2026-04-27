@@ -22,6 +22,9 @@ if [ ! -f build/CMakeCache.txt ]; then
     -DUSE_MPI=ON -DUSE_OPENMP=ON -DUSE_AVX2=ON
 fi
 
+# Plotting needs a real Python with pandas + matplotlib.
+module load python 2>/dev/null || true
+
 echo "== build =="
 cmake --build build -j 16
 

@@ -13,8 +13,6 @@ Expects solver_bench's `mode=mpi` rows (with t_alltoallv etc.) for strong/weak/c
 and mac_sim's metrics.csv for mac.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import sys
@@ -23,7 +21,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def _load(path: str) -> pd.DataFrame:
+def _load(path):
     df = pd.read_csv(path)
     return df
 

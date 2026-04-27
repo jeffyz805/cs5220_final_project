@@ -9,7 +9,11 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 mkdir -p report/figures
 
-PLOT="python3 scripts/analysis/plot_scaling.py"
+# Need pandas + matplotlib. Module-load on Perlmutter; harmless elsewhere.
+module load python 2>/dev/null || true
+
+PYTHON=${PYTHON:-python3}
+PLOT="$PYTHON scripts/analysis/plot_scaling.py"
 
 # Auto-discover most recent results dirs if not given.
 if [ $# -eq 3 ]; then
